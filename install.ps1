@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Lecture Assistant — Windows installer
+    Lecture Assistant -- Windows installer
 .DESCRIPTION
     Sets up a Python virtual environment, installs dependencies for the
     selected mode (lite or full), optionally pulls the Ollama model,
@@ -16,7 +16,7 @@ Write-Host ""
 Write-Host "=== Lecture Assistant Installer (Windows) ===" -ForegroundColor Cyan
 Write-Host ""
 
-# ── Python check ──────────────────────────────────────────────────────────────
+# -- Python check --------------------------------------------------------------
 $python = $null
 foreach ($cmd in @("python", "python3")) {
     try {
@@ -33,7 +33,7 @@ if (-not $python) {
 }
 Write-Host "Python found: $python" -ForegroundColor Green
 
-# ── Node check ────────────────────────────────────────────────────────────────
+# -- Node check ----------------------------------------------------------------
 try {
     $nodeVer = & node --version 2>&1
     Write-Host "Node found: $nodeVer" -ForegroundColor Green
@@ -42,25 +42,25 @@ try {
     exit 1
 }
 
-# ── GPU detection ─────────────────────────────────────────────────────────────
+# -- GPU detection -------------------------------------------------------------
 $hasGpu = $false
 try {
     $smi = & nvidia-smi --query-gpu=name --format=csv,noheader 2>&1
     if ($LASTEXITCODE -eq 0 -and $smi) { $hasGpu = $true; Write-Host "GPU: $($smi.Trim())" -ForegroundColor Green }
 } catch { }
-if (-not $hasGpu) { Write-Host "No NVIDIA GPU detected — will use CPU mode." -ForegroundColor Yellow }
+if (-not $hasGpu) { Write-Host "No NVIDIA GPU detected - will use CPU mode." -ForegroundColor Yellow }
 
-# ── Mode selection ────────────────────────────────────────────────────────────
+# -- Mode selection ------------------------------------------------------------
 Write-Host ""
 Write-Host "Select mode:"
-Write-Host "  [1] Full  — transcription + name alerts + AI Q&A (requires ~6 GB RAM)"
-Write-Host "  [2] Lite  — transcription + name alerts only   (requires ~1 GB RAM)"
+Write-Host "  [1] Full  - transcription + name alerts + AI Q&A (requires ~6 GB RAM)"
+Write-Host "  [2] Lite  - transcription + name alerts only   (requires ~1 GB RAM)"
 Write-Host ""
 $modeChoice = Read-Host "Enter 1 or 2 [default: 1]"
 $mode = if ($modeChoice -eq "2") { "lite" } else { "full" }
 Write-Host "Mode: $mode" -ForegroundColor Cyan
 
-# ── Virtual environment ───────────────────────────────────────────────────────
+# -- Virtual environment -------------------------------------------------------
 Write-Host ""
 Write-Host "Creating Python virtual environment..." -ForegroundColor Cyan
 & $python -m venv "$BASE\.venv"
@@ -70,7 +70,7 @@ $pythonVenv = "$BASE\.venv\Scripts\python.exe"
 # Upgrade pip silently
 & $pip install --upgrade pip --quiet
 
-# ── PyTorch (CUDA or CPU) ─────────────────────────────────────────────────────
+# -- PyTorch (CUDA or CPU) -----------------------------------------------------
 if ($mode -eq "full") {
     if ($hasGpu) {
         Write-Host "Installing PyTorch with CUDA 12.1..." -ForegroundColor Cyan
@@ -96,7 +96,7 @@ if ($mode -eq "full") {
     $whisperModel = "tiny"
 }
 
-# ── Ollama (full mode only) ───────────────────────────────────────────────────
+# -- Ollama (full mode only) ---------------------------------------------------
 if ($mode -eq "full") {
     Write-Host ""
     $ollamaOk = $false
@@ -116,7 +116,7 @@ if ($mode -eq "full") {
     & ollama pull llama3.2:3b
 }
 
-# ── Frontend ──────────────────────────────────────────────────────────────────
+# -- Frontend ------------------------------------------------------------------
 Write-Host ""
 Write-Host "Installing frontend dependencies..." -ForegroundColor Cyan
 Push-Location "$BASE\frontend"
@@ -125,7 +125,7 @@ Write-Host "Building frontend..." -ForegroundColor Cyan
 & npm.cmd run build
 Pop-Location
 
-# ── Write .env ────────────────────────────────────────────────────────────────
+# -- Write .env ----------------------------------------------------------------
 $chromaPath = [System.IO.Path]::Combine($env:LOCALAPPDATA, "lecture-assistant", "chroma_db")
 $ollamaNumGpu = if ($hasGpu) { "-1" } else { "0" }
 $env_content = @"
@@ -141,7 +141,7 @@ CHROMA_PATH=$($chromaPath -replace '\\', '/')
 "@
 Set-Content -Path "$BASE\.env" -Value $env_content -Encoding utf8
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+# -- Done ----------------------------------------------------------------------
 Write-Host ""
 Write-Host "===================================================" -ForegroundColor Green
 Write-Host " Installation complete!" -ForegroundColor Green
