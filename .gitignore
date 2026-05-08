@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# App data
+chroma_db/
+
+# WhisperLiveKit (cloned vendored dependency)
+WhisperLiveKit/
+
+# Node
+node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Scratch
+stdout.txt
+stderr.txt
