@@ -85,6 +85,8 @@ if ($mode -eq "full") {
     }
     Write-Host "Installing Full mode dependencies..." -ForegroundColor Cyan
     & $pip install -r "$BASE\requirements-full.txt" --quiet
+    Write-Host "Installing WhisperLiveKit (vendored)..." -ForegroundColor Cyan
+    & $pip install -e "$BASE\WhisperLiveKit" --quiet
     $whisperModel = "base"
 } else {
     Write-Host "Installing Lite mode dependencies..." -ForegroundColor Cyan
@@ -118,13 +120,14 @@ if ($mode -eq "full") {
 Write-Host ""
 Write-Host "Installing frontend dependencies..." -ForegroundColor Cyan
 Push-Location "$BASE\frontend"
-& npm install --silent
+& npm.cmd install --silent
 Write-Host "Building frontend..." -ForegroundColor Cyan
-& npm run build
+& npm.cmd run build
 Pop-Location
 
 # ── Write .env ────────────────────────────────────────────────────────────────
 $chromaPath = [System.IO.Path]::Combine($env:LOCALAPPDATA, "lecture-assistant", "chroma_db")
+$ollamaNumGpu = if ($hasGpu) { "-1" } else { "0" }
 $env_content = @"
 MODE=$mode
 WHISPER_MODEL=$whisperModel
@@ -133,6 +136,7 @@ WHISPER_COMPUTE_TYPE=$computeType
 AUDIO_DEVICE_INDEX=-1
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2:3b
+OLLAMA_NUM_GPU=$ollamaNumGpu
 CHROMA_PATH=$($chromaPath -replace '\\', '/')
 "@
 Set-Content -Path "$BASE\.env" -Value $env_content -Encoding utf8
