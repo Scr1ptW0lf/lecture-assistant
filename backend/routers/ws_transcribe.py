@@ -17,23 +17,40 @@ logger = logging.getLogger(__name__)
 
 SUMMARY_INTERVAL_SECONDS = 120
 
-# Whisper hallucinations emitted on silence or near-silence audio.
 _HALLUCINATION = re.compile(
-    r"^[.…,!?\-\s]+$"             # punctuation/whitespace only
-    r"|^(uh+|um+|hmm*|hm+)\.?$"   # filler sounds
+    r"^[.…,!?\-\s]+$"
+    r"|^(uh+|um+|hmm*|hm+)\.?$"
     r"|^thank you\.?$"
     r"|^thanks\.?$"
     r"|^you\.?$"
     r"|^bye(-bye)?\.?$"
     r"|^goodbye\.?$"
     r"|^see you\.?$"
-    r"|^\[.+\]$",                  # [Music], [Applause], etc.
+    r"|^\[.+\]$",
     re.IGNORECASE,
 )
 
 
 def _is_hallucination(text: str) -> bool:
     return bool(_HALLUCINATION.match(text.strip()))
+
+
+def _parse_ts(ts: str) -> float | None:
+    """Parse 'H:MM:SS.ff' timestamp string to float seconds."""
+    m = re.match(r'^(\d+):(\d{2}):(\d{2})\.(\d+)$', ts)
+    if not m:
+        return None
+    frac = float("0." + m.group(4))
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + frac
+
+
+def _format_ts(secs: float) -> str:
+    """Format float seconds back to 'H:MM:SS.cc'."""
+    h = int(secs // 3600)
+    secs -= h * 3600
+    m = int(secs // 60)
+    secs -= m * 60
+    return f"{h}:{m:02d}:{secs:05.2f}"
 
 
 def _split_sentences(text: str, per_chunk: int = 4, max_words: int = 40) -> list[str]:
@@ -92,7 +109,7 @@ async def transcribe_ws(websocket: WebSocket):
     # Both send_results (appender) and summary_loop (reader) reference this list.
     all_transcript_lines: list = []
 
-    # Serialise all WebSocket sends so concurrent summary tasks don't interleave frames.
+    # Serialise all WebSocket sends so concurrent tasks don't interleave frames.
     send_lock = asyncio.Lock()
 
     async def safe_send(data: dict):
@@ -110,41 +127,61 @@ async def transcribe_ws(websocket: WebSocket):
         "general":  "key topics and ideas discussed",
     }
 
-    async def stream_summary(summary_id: str, transcript_lines: list):
-        """Stream a cumulative summary of the audio transcript so far."""
+    async def stream_summary(summary_id: str, new_lines: list, prior_summary: str = "") -> str:
+        """
+        Stream a summary of new_lines, optionally extending prior_summary.
+        Returns the completed summary text.
+        """
         if settings.mode != "full":
-            return
+            return ""
         try:
             from backend.llm import ollama
 
-            transcript_text = " ".join(
-                entry["text"] for entry in transcript_lines if entry.get("text", "").strip()
+            new_text = " ".join(
+                entry["text"] for entry in new_lines if entry.get("text", "").strip()
             )
-            if not transcript_text.strip():
-                return
+            if not new_text.strip():
+                return ""
 
             focus = _CONTENT_FOCUS.get(content_type, _CONTENT_FOCUS["general"])
             context_line = f"Context: {user_context}\n" if user_context else ""
             content_label = {"lecture": "lecture", "meeting": "meeting", "video": "video",
                              "podcast": "podcast", "general": "audio recording"}.get(content_type, "audio recording")
 
-            prompt = (
-                f"{context_line}"
-                f"You are summarizing a live {content_label}. "
-                "The transcript below is raw and unformatted — it contains sentence fragments, "
-                "filler words, repeated phrases, and may lack proper punctuation. "
-                "Ignore formatting artifacts and focus on actual content.\n\n"
-                f"TRANSCRIPT SO FAR:\n{transcript_text}\n\n"
-                f"Write a concise cumulative summary focusing on {focus}. "
-                "Use 3-5 bullet points. Be specific to what was actually said.\n\nSUMMARY:"
-            )
+            if prior_summary:
+                prompt = (
+                    f"{context_line}"
+                    f"You are maintaining a running summary of a live {content_label}. "
+                    "The transcript is raw — ignore filler words and formatting artifacts.\n\n"
+                    f"PREVIOUS SUMMARY:\n{prior_summary}\n\n"
+                    f"NEW TRANSCRIPT (since last summary):\n{new_text}\n\n"
+                    f"Extend the summary with new information about {focus}. "
+                    "Keep all previous bullet points and add new ones for what was just covered. "
+                    "Use 3-8 bullet points total. Use **bold** for key terms. Be specific.\n\nUPDATED SUMMARY:"
+                )
+            else:
+                prompt = (
+                    f"{context_line}"
+                    f"You are summarizing a live {content_label}. "
+                    "The transcript below is raw — it contains sentence fragments, "
+                    "filler words, and may lack proper punctuation. "
+                    "Ignore formatting artifacts and focus on actual content.\n\n"
+                    f"TRANSCRIPT SO FAR:\n{new_text}\n\n"
+                    f"Write a concise summary focusing on {focus}. "
+                    "Use 3-5 bullet points. Use **bold** for key terms. "
+                    "Be specific to what was actually said.\n\nSUMMARY:"
+                )
 
+            collected: list[str] = []
             async for token in ollama.chat_stream(prompt):
+                collected.append(token)
                 await safe_send({"type": "summary", "id": summary_id, "token": token, "done": False})
 
             await safe_send({"type": "summary", "id": summary_id, "token": "", "done": True})
+            return "".join(collected)
         except Exception as e:
             logger.error("stream_summary error: %s", e)
+            return ""
 
     async def feed_audio():
         """Drain loopback PCM from queue, convert float32→s16le, feed to WhisperLiveKit."""
@@ -165,9 +202,8 @@ async def transcribe_ws(websocket: WebSocket):
         Consume WhisperLiveKit results and push full state to the client.
 
         Sends {type:"state", lines:[...], buffer:"..."} on every change.
-        The frontend replaces its full line list — this avoids the sent_lines
-        counter bug where the growing in-progress segment would stop being sent
-        after the first iteration.
+        Each line includes a display_ts field with an interpolated timestamp for UI display,
+        separate from the unique start key used for deduplication.
         """
         alerted_starts: set[str] = set()
         seen_starts: set[str] = set()
@@ -187,18 +223,48 @@ async def transcribe_ws(websocket: WebSocket):
                     start_key = line.get("start", "")
                     end_key = line.get("end", "")
 
-                    # Split long segments into individual sentences so the frontend
-                    # receives many small lines it can group into paragraphs.
                     sentences = _split_sentences(text)
+                    total_words = max(1, sum(len(s.split()) for s in sentences))
+
+                    # Interpolate per-sentence display timestamps using word position.
+                    start_secs = _parse_ts(start_key)
+                    end_secs = _parse_ts(end_key)
+                    can_interp = (
+                        start_secs is not None
+                        and end_secs is not None
+                        and end_secs > start_secs + 0.5
+                    )
+
+                    word_offset = 0
                     for s_idx, sentence in enumerate(sentences):
-                        sub_key = start_key if s_idx == 0 else f"{start_key}:{s_idx}"
+                        if s_idx == 0:
+                            sub_key = start_key
+                            display_ts = start_key
+                        elif can_interp:
+                            frac = word_offset / total_words
+                            est = start_secs + frac * (end_secs - start_secs)  # type: ignore[operator]
+                            display_ts = _format_ts(est)
+                            # Append index for dedup uniqueness if estimate equals start
+                            sub_key = f"{display_ts}:{s_idx}" if display_ts == start_key else display_ts
+                        else:
+                            sub_key = f"{start_key}:{s_idx}"
+                            display_ts = start_key
+
+                        word_offset += len(sentence.split())
+
                         sub_name_hit = detect_name(sentence, student_name)
 
                         if sub_name_hit and sub_key not in alerted_starts:
                             alerted_starts.add(sub_key)
                             new_alerts.append(sentence)
 
-                        entry = {"start": sub_key, "end": end_key, "text": sentence, "name_detected": sub_name_hit}
+                        entry = {
+                            "start": sub_key,
+                            "display_ts": display_ts,
+                            "end": end_key,
+                            "text": sentence,
+                            "name_detected": sub_name_hit,
+                        }
                         frontend_lines.append(entry)
 
                         if sub_key not in seen_starts:
@@ -222,16 +288,29 @@ async def transcribe_ws(websocket: WebSocket):
             logger.error("send_results error: %s", e, exc_info=True)
 
     async def summary_loop():
-        """Fire a cumulative summary every 2 minutes while connected."""
+        """
+        Fire a cumulative summary every 2 minutes.
+        Each round passes only the NEW lines since the last summary, plus the previous summary
+        text, so the LLM grows the summary incrementally rather than re-reading everything.
+        """
         summary_count = 0
+        last_summarized_idx = 0
+        prior_summary_text = ""
+
         while True:
             await asyncio.sleep(SUMMARY_INTERVAL_SECONDS)
-            if not all_transcript_lines:
+            new_lines = all_transcript_lines[last_summarized_idx:]
+            if not new_lines:
                 continue
+
             summary_count += 1
-            asyncio.create_task(
-                stream_summary(f"summary-{summary_count}", list(all_transcript_lines))
-            )
+            summary_id = f"summary-{summary_count}"
+            last_summarized_idx = len(all_transcript_lines)
+
+            # Await directly so we can capture completed text for the next round.
+            completed = await stream_summary(summary_id, list(new_lines), prior_summary_text)
+            if completed:
+                prior_summary_text = completed
 
     on_demand_count = 0
 
@@ -251,7 +330,11 @@ async def transcribe_ws(websocket: WebSocket):
                     if data.get("type") == "request_summary" and all_transcript_lines:
                         on_demand_count += 1
                         asyncio.create_task(
-                            stream_summary(f"summary-demand-{on_demand_count}", list(all_transcript_lines))
+                            stream_summary(
+                                f"summary-demand-{on_demand_count}",
+                                list(all_transcript_lines),
+                                "",  # on-demand: full transcript summary from scratch
+                            )
                         )
                 except Exception:
                     pass

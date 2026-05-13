@@ -38,7 +38,7 @@ export function useTranscript({ studentName, deviceIndex, source, contentType, u
     ws.onmessage = (evt) => {
       const msg = JSON.parse(evt.data) as {
         type: string;
-        lines?: Array<{ start: string; end: string; text: string; name_detected: boolean }>;
+        lines?: Array<{ start: string; display_ts?: string; end: string; text: string; name_detected: boolean }>;
         buffer?: string;
         new_name_alerts?: string[];
         id?: string;
@@ -52,6 +52,7 @@ export function useTranscript({ studentName, deviceIndex, source, contentType, u
           .filter((l) => !clearedIds.current.has(l.start || ""))
           .map((l) => ({
             id: l.start || `${Date.now()}-${Math.random()}`,
+            displayTs: l.display_ts || l.start || "",
             end: l.end || "",
             text: l.text,
             nameDetected: l.name_detected,
@@ -107,9 +108,16 @@ export function useTranscript({ studentName, deviceIndex, source, contentType, u
     setBufferText("");
   }, []);
 
+  const restoreSession = useCallback((savedLines: TranscriptLine[], savedSummaries: Summary[]) => {
+    clearedIds.current.clear();
+    setLines(savedLines);
+    setSummaries(savedSummaries);
+    setBufferText("");
+  }, []);
+
   const requestSummary = useCallback(() => {
     wsRef.current?.send(JSON.stringify({ type: "request_summary" }));
   }, []);
 
-  return { lines, bufferText, isConnected, connect, disconnect, clearLines, summaries, requestSummary };
+  return { lines, bufferText, isConnected, connect, disconnect, clearLines, restoreSession, summaries, requestSummary };
 }

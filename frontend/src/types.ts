@@ -1,8 +1,9 @@
 export type AppMode = "lite" | "full";
 
 export interface TranscriptLine {
-  id: string;    // start timestamp "H:MM:SS.cc"
-  end: string;   // end timestamp "H:MM:SS.cc"
+  id: string;         // unique dedup key (may include :n suffix)
+  displayTs: string;  // clean timestamp for UI display ("H:MM:SS.cc")
+  end: string;
   text: string;
   nameDetected: boolean;
   timestamp: number;
@@ -35,4 +36,14 @@ export interface EngineSettings {
   ollama_model: string;
   ollama_num_gpu: number;
   mode: AppMode;
+}
+
+export interface SessionData {
+  version: number;
+  saved_at: string;
+  student_name?: string;
+  content_type?: string;
+  user_context?: string;
+  lines: TranscriptLine[];
+  summaries: Summary[];
 }

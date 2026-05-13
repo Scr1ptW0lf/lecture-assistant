@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { streamAnswer } from "../api";
 import type { QAPair, Summary } from "../types";
+import { MarkdownText } from "./MarkdownText";
 
 interface Props {
   summaries?: Summary[];
@@ -75,10 +76,13 @@ export function QAPanel({ summaries = [], source, onRequestSummary }: Props) {
           {!latestSummary ? (
             <p style={styles.empty}>A summary will appear here every 2 minutes of lecture.</p>
           ) : (
-            <p style={styles.summaryText}>
-              {latestSummary.text || <span style={styles.cursor}>▋</span>}
-              {latestSummary.streaming && latestSummary.text && <span style={styles.cursor}>▋</span>}
-            </p>
+            <div style={styles.summaryContent}>
+              <MarkdownText
+                text={latestSummary.text}
+                style={styles.summaryText}
+              />
+              {latestSummary.streaming && <span style={styles.cursor}>▋</span>}
+            </div>
           )}
         </div>
       </div>
@@ -98,10 +102,14 @@ export function QAPanel({ summaries = [], source, onRequestSummary }: Props) {
           {manualPairs.map((p) => (
             <div key={p.id} style={styles.pair}>
               <p style={styles.q}>{p.question}</p>
-              <p style={styles.a}>
-                {p.answer || (p.streaming ? <span style={styles.cursor}>▋</span> : "")}
+              <div style={styles.answerWrap}>
+                {p.answer ? (
+                  <MarkdownText text={p.answer} style={styles.answerMd} />
+                ) : p.streaming ? (
+                  <span style={styles.cursor}>▋</span>
+                ) : null}
                 {p.streaming && p.answer && <span style={styles.cursor}>▋</span>}
-              </p>
+              </div>
             </div>
           ))}
         </div>
@@ -177,12 +185,13 @@ const styles = {
     borderRadius: 4,
     padding: "0.5rem 0.6rem",
   },
+  summaryContent: {
+    position: "relative" as const,
+  },
   summaryText: {
     color: "#e2e8f0",
     fontSize: "0.82rem",
     lineHeight: 1.6,
-    whiteSpace: "pre-wrap" as const,
-    margin: 0,
   },
   history: { flex: 1, overflowY: "auto" as const, marginBottom: "0.5rem" },
   empty: { color: "#4a5568", fontSize: "0.82rem" },
@@ -193,7 +202,14 @@ const styles = {
     fontSize: "0.82rem",
     marginBottom: "0.25rem",
   },
-  a: { color: "#e2e8f0", fontSize: "0.82rem", lineHeight: 1.55, whiteSpace: "pre-wrap" as const },
+  answerWrap: {
+    minHeight: "1.2rem",
+  },
+  answerMd: {
+    color: "#e2e8f0",
+    fontSize: "0.82rem",
+    lineHeight: 1.55,
+  },
   cursor: { animation: "blink 1s step-end infinite", display: "inline-block" },
   inputRow: { display: "flex", gap: "0.5rem", alignItems: "flex-end" },
   textarea: {

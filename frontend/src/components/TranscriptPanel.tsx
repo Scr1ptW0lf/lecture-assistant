@@ -6,25 +6,24 @@ interface Props {
   bufferText: string;
   onClear: () => void;
   onSave: () => void;
+  onSaveSession: () => void;
+  onLoadSession: () => void;
 }
 
-
-function formatTimestamp(timeStr: string): string {
-  if (!timeStr || timeStr.length > 12) return "";
-  return timeStr.replace(/\.\d+$/, ""); // strip sub-second precision for display
+function formatTimestamp(ts: string): string {
+  if (!ts) return "";
+  // Strip sub-second precision: "0:10:57.88" → "0:10:57"
+  return ts.replace(/\.\d+$/, "");
 }
 
 /**
- * Group committed segments into visual paragraphs.
- * Breaks on whichever comes first: N sentence-endings OR N lines.
- * The line cap is the primary mechanism because LocalAgreement only emits
- * a handful of committed segments per minute — sentence counting alone
- * never accumulates enough to fire.
+ * Group committed lines into visual paragraphs.
+ * A new paragraph starts when maxLines or maxSentences is reached.
  */
 function groupIntoParagraphs(
   lines: TranscriptLine[],
-  maxSentences = 3,
-  maxLines = 3,
+  maxSentences = 5,
+  maxLines = 5,
 ): TranscriptLine[][] {
   if (lines.length === 0) return [];
   const groups: TranscriptLine[][] = [[]];
@@ -50,7 +49,7 @@ function groupIntoParagraphs(
   return groups;
 }
 
-export function TranscriptPanel({ lines, bufferText, onClear, onSave }: Props) {
+export function TranscriptPanel({ lines, bufferText, onClear, onSave, onSaveSession, onLoadSession }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -72,10 +71,18 @@ export function TranscriptPanel({ lines, bufferText, onClear, onSave }: Props) {
       <div style={styles.header}>
         <span style={styles.title}>Live Transcript</span>
         <div style={styles.headerBtns}>
+          <button style={styles.headerBtn} onClick={onLoadSession} title="Load a saved session">
+            Load
+          </button>
           {lines.length > 0 && (
-            <button style={styles.headerBtn} onClick={onSave} title="Save transcript as .txt">
-              Save
-            </button>
+            <>
+              <button style={styles.headerBtn} onClick={onSaveSession} title="Save session as JSON">
+                Save Session
+              </button>
+              <button style={styles.headerBtn} onClick={onSave} title="Export transcript as .txt">
+                Export .txt
+              </button>
+            </>
           )}
           {(lines.length > 0 || bufferText) && (
             <button style={styles.headerBtn} onClick={onClear}>
@@ -92,21 +99,23 @@ export function TranscriptPanel({ lines, bufferText, onClear, onSave }: Props) {
 
         {paragraphs.map((group, gi) => (
           <div key={group[0].id} style={styles.paragraph}>
-            {/* Paragraph break separator (not before the very first group) */}
             {gi > 0 && (
               <div style={styles.breakRow}>
                 <hr style={styles.breakLine} />
-                <span style={styles.breakLabel}>{formatTimestamp(group[0].id)}</span>
+                <span style={styles.breakLabel}>{formatTimestamp(group[0].displayTs)}</span>
                 <hr style={styles.breakLine} />
               </div>
             )}
 
-            {group.map((line) => (
+            {group.map((line, li) => (
               <div
                 key={line.id}
                 style={line.nameDetected ? styles.lineHighlight : styles.line}
               >
-                <span style={styles.ts}>{gi === 0 || line === group[0] ? formatTimestamp(line.id) : ""}</span>
+                {/* Timestamp only for the first line of each paragraph */}
+                <span style={styles.ts}>
+                  {li === 0 ? formatTimestamp(line.displayTs) : ""}
+                </span>
                 <span>{line.text}</span>
                 {line.nameDetected && <span style={styles.alert}>🔔 Your name!</span>}
               </div>
@@ -140,9 +149,11 @@ const styles = {
     alignItems: "center",
     padding: "0.6rem 1rem",
     borderBottom: "1px solid #2d3148",
+    flexWrap: "wrap" as const,
+    gap: "0.3rem",
   },
   title: { fontWeight: 600, fontSize: "0.9rem", color: "#90cdf4" },
-  headerBtns: { display: "flex", gap: "0.4rem" },
+  headerBtns: { display: "flex", gap: "0.4rem", flexWrap: "wrap" as const },
   headerBtn: {
     background: "none",
     border: "1px solid #4a5568",
@@ -161,7 +172,7 @@ const styles = {
     display: "flex",
     alignItems: "center",
     gap: "0.5rem",
-    margin: "0.75rem 0 0.5rem",
+    margin: "0.75rem 0 0.4rem",
   },
   breakLine: {
     flex: 1,
@@ -179,7 +190,7 @@ const styles = {
     display: "flex",
     gap: "0.6rem",
     alignItems: "baseline",
-    padding: "3px 0",
+    padding: "2px 0",
     fontSize: "0.88rem",
   },
   lineHighlight: {
