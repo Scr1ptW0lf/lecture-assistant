@@ -202,17 +202,24 @@ async def transcribe_ws(websocket: WebSocket):
         Consume WhisperLiveKit results and push full state to the client.
 
         Sends {type:"state", lines:[...], buffer:"..."} on every change.
-        Each line includes a display_ts field with an interpolated timestamp for UI display,
-        separate from the unique start key used for deduplication.
+
+        WhisperLiveKit internally prunes validated_segments older than 5 minutes
+        (tokens_alignment._DEFAULT_RETENTION_SECONDS). To prevent data loss we maintain
+        all_frontend_lines — our own ordered dict that accumulates every line for the full
+        session and is never pruned.  The sub_key (start field) uses the stable
+        "start_key:s_idx" scheme so the same sentence always gets the same key even as the
+        in-progress segment grows.  display_ts is interpolated from word position and may
+        update until the segment is committed, which is fine.
         """
         alerted_starts: set[str] = set()
         seen_starts: set[str] = set()
+        # Ordered dict sub_key → entry; never pruned, replaces WhisperLiveKit's pruned view.
+        all_frontend_lines: dict[str, dict] = {}
 
         try:
             async for response in results_gen:
                 d = response.to_dict()
 
-                frontend_lines = []
                 new_alerts = []
 
                 for line in d.get("lines", []):
@@ -226,7 +233,6 @@ async def transcribe_ws(websocket: WebSocket):
                     sentences = _split_sentences(text)
                     total_words = max(1, sum(len(s.split()) for s in sentences))
 
-                    # Interpolate per-sentence display timestamps using word position.
                     start_secs = _parse_ts(start_key)
                     end_secs = _parse_ts(end_key)
                     can_interp = (
@@ -237,17 +243,16 @@ async def transcribe_ws(websocket: WebSocket):
 
                     word_offset = 0
                     for s_idx, sentence in enumerate(sentences):
-                        if s_idx == 0:
-                            sub_key = start_key
-                            display_ts = start_key
-                        elif can_interp:
+                        # Stable dedup key — never changes once the sentence is added.
+                        sub_key = start_key if s_idx == 0 else f"{start_key}:{s_idx}"
+
+                        # Display timestamp: interpolated from word position for nicer UI.
+                        # Updates as in-progress segment grows; stabilises once committed.
+                        if can_interp and s_idx > 0:
                             frac = word_offset / total_words
                             est = start_secs + frac * (end_secs - start_secs)  # type: ignore[operator]
                             display_ts = _format_ts(est)
-                            # Append index for dedup uniqueness if estimate equals start
-                            sub_key = f"{display_ts}:{s_idx}" if display_ts == start_key else display_ts
                         else:
-                            sub_key = f"{start_key}:{s_idx}"
                             display_ts = start_key
 
                         word_offset += len(sentence.split())
@@ -265,7 +270,9 @@ async def transcribe_ws(websocket: WebSocket):
                             "text": sentence,
                             "name_detected": sub_name_hit,
                         }
-                        frontend_lines.append(entry)
+
+                        # Always write to update display_ts / text for in-progress segments.
+                        all_frontend_lines[sub_key] = entry
 
                         if sub_key not in seen_starts:
                             seen_starts.add(sub_key)
@@ -275,7 +282,7 @@ async def transcribe_ws(websocket: WebSocket):
 
                 await safe_send({
                     "type": "state",
-                    "lines": frontend_lines,
+                    "lines": list(all_frontend_lines.values()),
                     "buffer": buffer,
                     "new_name_alerts": new_alerts,
                 })
