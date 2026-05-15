@@ -33,8 +33,8 @@ System audio output (loopback)
   → backend/transcription.py  (WhisperLiveKit AudioProcessor, pcm_input=True, LocalAgreement policy)
   → backend/name_detector.py  (exact + difflib fuzzy match)
   → WebSocket /ws/transcribe  (full-state-replace protocol)
-      summary_loop()          (fires Ollama summary every 120 s via all_transcript_lines)
-  → React frontend            (TranscriptPanel, QAPanel, browser Notification API)
+      summary_loop()          (cumulative Ollama summary every 120 s)
+  → React frontend            (TranscriptPanel, QAPanel, MarkdownText, browser Notification API)
 
 PDF upload → backend/rag.py   (PyMuPDF → ChromaDB, sentence-transformers embeddings)
 Question   → /api/qa          (ChromaDB retrieval + Ollama llama3.2:3b → SSE stream)
@@ -51,19 +51,67 @@ Set via `MODE` in `.env`:
 
 The FastAPI routers for `/api/qa` and `/api/ingest` are only registered when `MODE=full`. `backend/config.py` applies sensible defaults automatically (e.g. `tiny` when mode is `lite`, `float16` when device is `cuda`).
 
+## Frontend file map
+
+| File | Purpose |
+|------|---------|
+| `src/App.tsx` | Root layout, autosave to localStorage, restore-session banner, save/load JSON session handlers |
+| `src/hooks/useTranscript.ts` | WebSocket lifecycle, `lines`/`summaries` state, `clearLines()`, `restoreSession()` |
+| `src/components/TranscriptPanel.tsx` | Transcript display, paragraph grouping, Load/Save Session/Export .txt buttons |
+| `src/components/QAPanel.tsx` | Live Summary pane + Q&A pane; uses `MarkdownText` for both |
+| `src/components/MarkdownText.tsx` | Inline markdown renderer (`**bold**`, `- bullets`, `# headers`) — no npm dep |
+| `src/components/SettingsBar.tsx` | Top bar: name, device, content type, user context, connect/disconnect |
+| `src/components/SettingsModal.tsx` | Whisper/Ollama settings overlay (Save / Save & Reinitialize) |
+| `src/components/UploadPanel.tsx` | PDF upload + source selector for RAG |
+| `src/components/DeviceSelector.tsx` | Audio device dropdown |
+| `src/hooks/useNotification.ts` | Browser Notification API wrapper |
+| `src/api.ts` | `fetchConfig`, `fetchDevices`, `fetchRagSources`, `streamAnswer` (SSE) |
+| `src/types.ts` | All shared TypeScript interfaces (see below) |
+
+## TypeScript types (`src/types.ts`)
+
+```typescript
+TranscriptLine {
+  id: string;        // dedup key — stable "start_key" or "start_key:s_idx"
+  displayTs: string; // clean timestamp for UI ("H:MM:SS.cc"), interpolated from word position
+  end: string;
+  text: string;
+  nameDetected: boolean;
+  timestamp: number; // wall-clock ms when received
+  final: boolean;
+}
+
+Summary { id: string; text: string; streaming: boolean; }
+
+SessionData {        // shape of autosave JSON and saved session files
+  version: number;
+  saved_at: string;  // ISO timestamp
+  student_name?: string; content_type?: string; user_context?: string;
+  lines: TranscriptLine[];
+  summaries: Summary[];
+}
+
+QAPair { id; question; answer; streaming }
+AudioDevice { index; name; is_recommended }
+EngineSettings { whisper_model; whisper_device; whisper_compute_type; ollama_model; ollama_num_gpu; mode }
+AppMode = "lite" | "full"
+```
+
 ## WhisperLiveKit integration
 
 `WhisperLiveKit/` is a **vendored local clone** installed as an editable package (`pip install -e WhisperLiveKit/`). Do not install it from PyPI.
 
 Key design decisions:
-- `backend_policy="localagreement"` — LocalAgreement (not SimulStreaming). SimulStreaming's `get_buffer()` returns empty text for non-auto languages, so the live buffer preview would never appear.
+- `backend_policy="localagreement"` — LocalAgreement (not SimulStreaming). SimulStreaming's `get_buffer()` returns empty text for non-auto languages.
 - `pcm_input=True` — skips FFmpeg; we feed raw s16le bytes converted from float32 loopback audio.
 - `vac=True` — Silero VAD gates audio to the transcription queue; reduces hallucination on silence.
-- `TranscriptionEngine` is a **process-level singleton** (double-checked locking). `make_processor()` returns a fresh `AudioProcessor` per WebSocket session wrapping the shared engine. To reload with new settings, call `TranscriptionEngine.reset()` first — this clears `_instance` and `_initialized` so the next constructor call runs `_do_init`. `backend/transcription.load()` does this automatically.
+- `TranscriptionEngine` is a **process-level singleton** (double-checked locking). `make_processor()` returns a fresh `AudioProcessor` per WebSocket session wrapping the shared engine.
 
-The `results_formatter()` async generator in `AudioProcessor` yields `FrontData` objects every 50 ms when state changes. `FrontData.to_dict()["lines"]` includes **both** committed segments (from `validated_segments`) and the current in-progress segment (from `current_line_tokens`). Lines only move to `validated_segments` after a **>5 second silence** (`MIN_DURATION_REAL_SILENCE = 5` in `audio_processor.py`). During normal continuous speech, the entire session accumulates as a single growing segment.
+`FrontData.to_dict()["lines"]` includes **both** committed segments (from `validated_segments`) and the current in-progress segment (from `current_line_tokens`). Lines only move to `validated_segments` after a **>5 second silence** (`MIN_DURATION_REAL_SILENCE = 5`). During normal continuous speech, the entire session accumulates as a single growing segment.
 
-**Paragraph splitting workaround:** Because WhisperLiveKit emits at most one committed segment per 5-second silence, `send_results()` in `ws_transcribe.py` calls `_split_sentences()` to break each segment's text into chunks of up to 4 sentences (≤40 words) before sending to the frontend. This gives the frontend enough lines to group into visual paragraphs.
+**Critical gotcha — WhisperLiveKit prunes history:** `TokensAlignment._prune()` (in `WhisperLiveKit/whisperlivekit/tokens_alignment.py`) drops `validated_segments` older than `_DEFAULT_RETENTION_SECONDS = 300` seconds (5 min) on every `get_lines()` call. **Never use `d.get("lines", [])` as the authoritative frontend state** — it loses old content. The fix is `all_frontend_lines` (see `send_results` below).
+
+**Paragraph splitting:** `send_results()` calls `_split_sentences()` to break each segment's text into chunks of up to 4 sentences (≤40 words). The frontend groups every 5 lines into a visual paragraph.
 
 ## WebSocket protocol
 
@@ -71,45 +119,102 @@ Client → server (on connect, one message only):
 ```json
 { "student_name": "Aidan", "device_index": -1, "source": "textbook.pdf", "content_type": "lecture", "user_context": "COMP3900 algorithms midterm review" }
 ```
-`source` is optional — omit or `null` to disable textbook RAG. `content_type` is one of `lecture | meeting | video | podcast | general` (defaults to `general`). `user_context` is a free-text string for grounding the AI summary/answers (optional).
+`source` is optional. `content_type`: `lecture | meeting | video | podcast | general`. `user_context`: free text (optional).
 
-Client → server (after connect, on demand):
+Client → server (on demand):
 ```json
 { "type": "request_summary" }
 ```
-Triggers an immediate on-demand summary outside the 2-minute cycle.
 
 Server → client:
 ```json
-{ "type": "state", "lines": [{"start": "0:00:01.23", "end": "0:00:03.45", "text": "...", "name_detected": false}], "buffer": "current hypothesis...", "new_name_alerts": [] }
+{ "type": "state", "lines": [{"start": "0:00:01.23", "display_ts": "0:00:01.23", "end": "0:00:03.45", "text": "...", "name_detected": false}], "buffer": "...", "new_name_alerts": [] }
 { "type": "summary", "id": "summary-1", "token": "...", "done": false }
 { "type": "summary", "id": "summary-1", "token": "", "done": true }
 { "type": "status", "message": "Transcription started" }
 { "type": "error", "message": "..." }
 ```
 
-`lines` is the **complete current line list** (not a diff). Each line includes `end` (segment end timestamp). The backend splits long segments into up to 4-sentence lines. The frontend groups every 3 lines into a visual paragraph.
+Each line object has two timestamp fields:
+- `start` — stable dedup key: `"H:MM:SS.cc"` for s_idx=0, `"H:MM:SS.cc:N"` for subsequent split-sentences from the same segment. **Never changes once created.** Used as React `key` and in `clearedIds`.
+- `display_ts` — interpolated from word position within the segment's start→end range; shows a better per-sentence time in the UI. Updates on each frame while the segment is in-progress, stabilises once committed.
 
-`summary` messages stream a cumulative Ollama summary every `SUMMARY_INTERVAL_SECONDS` (120 s) or on demand. The frontend accumulates tokens keyed by `id` and displays only the latest summary in the Live Summary pane. The `all_transcript_lines` accumulator is a list defined in the outer `transcribe_ws` scope and shared by closure between `send_results` (appender) and `summary_loop`/the on-demand handler (readers). Do not redeclare it inside any inner function.
+`lines` is the **complete session line list** (not a diff), built from `all_frontend_lines` (never pruned). The frontend replaces its full line list on every state message.
 
-The `clearedIds` pattern on the frontend: when the user clicks Clear, the current line IDs are added to a `Set` ref. The `state` message handler filters out any line whose `start` is in that set, so cleared lines never re-appear even though the server keeps sending full state.
+`summary` tokens are accumulated by `id`. The frontend shows only the latest summary. Each periodic summary is a new ID; on-demand summaries use `"summary-demand-N"` IDs.
 
-The main WebSocket handler blocks on `websocket.receive()` to detect the client close frame. When the client disconnects, `feed_task`, `results_task`, and `summary_task` are cancelled and `audio_processor.cleanup()` is called.
+The `clearedIds` pattern: when the user clicks Clear, current line IDs go into a `Set` ref. Future `state` messages filter out those IDs so cleared lines never reappear.
 
 Frontend reconnects after 3 s on close and re-sends the init message.
+
+## `send_results()` design — `ws_transcribe.py`
+
+The three key data structures inside `send_results()`:
+
+```
+all_frontend_lines: dict[str, dict]   # ordered dict sub_key→entry; accumulates forever, never pruned.
+                                       # This is what gets sent to the frontend each update.
+seen_starts: set[str]                  # dedup gate for all_transcript_lines only.
+all_transcript_lines: list             # LLM summary accumulator; shared with summary_loop by closure.
+```
+
+On each WhisperLiveKit update:
+1. Rebuild entries from `d.get("lines", [])` — WhisperLiveKit's pruned view.
+2. Write every entry into `all_frontend_lines[sub_key]` (insert or update in place).
+3. Gate adds to `all_transcript_lines` through `seen_starts`.
+4. Send `list(all_frontend_lines.values())` — complete unpruned history.
+
+Helper functions: `_parse_ts(ts) → float | None`, `_format_ts(secs) → str` — convert `"H:MM:SS.cc"` ↔ float seconds for timestamp interpolation.
+
+## Summary system
+
+`stream_summary(summary_id, new_lines, prior_summary="") → str`
+- If `prior_summary` is non-empty: prompts the LLM to extend the previous summary with new transcript content. Returns the full completed text.
+- If `prior_summary` is empty: generates a fresh summary from scratch.
+- Requests `**bold**` for key terms so `MarkdownText` renders them.
+
+`summary_loop()` — **awaits** `stream_summary` directly (no `create_task`). Tracks:
+- `last_summarized_idx` — index into `all_transcript_lines` at end of last round; new rounds pass only `all_transcript_lines[last_summarized_idx:]`.
+- `prior_summary_text` — accumulated summary text fed to the next round.
+
+On-demand summaries (`request_summary` message) pass the full `all_transcript_lines` list with `prior_summary=""` (complete fresh summary, not incremental).
+
+## Session persistence
+
+**Autosave:** `App.tsx` debounces writes to `localStorage["la_autosave_session"]` (key `LS_AUTOSAVE`) 30 s after any `lines` or `summaries` change. Shape: `SessionData` JSON.
+
+**Restore banner:** On mount, App checks localStorage for a non-empty saved session and renders a blue banner with "Restore" / "Dismiss" buttons.
+
+**Save Session button** in `TranscriptPanel` header: downloads `SessionData` as a `.json` file.
+**Load Session button**: opens a file picker, parses JSON, calls `restoreSession(lines, summaries)` from `useTranscript`.
+**Export .txt button**: downloads lines as plain text (one `[displayTs] text` line each).
+
+`useTranscript.restoreSession(lines, summaries)`: clears `clearedIds` ref, then `setLines` + `setSummaries`. Called both by the restore-banner handler and by the Load Session file picker.
+
+## `MarkdownText` component
+
+`src/components/MarkdownText.tsx` — renders the LLM output for both Live Summary and Q&A answers.
+
+Handles:
+- `**bold**` → `<strong>`
+- Lines starting with `- ` or `* ` → bullet with `•` prefix in accent colour
+- Lines starting with `# `, `## `, `### ` → styled headers
+- Blank lines → 0.35rem spacer
+
+No npm dependencies (no `react-markdown`). Sufficient for the bullet-point output the LLM produces.
+
+**Do not use a `<p>` tag** for LLM output — use `<MarkdownText text={...} style={...} />` instead.
 
 ## Runtime settings API
 
 `backend/routers/settings.py` — registered in both `lite` and `full` modes:
 
 - `GET /api/settings` — returns `whisper_model`, `whisper_device`, `whisper_compute_type`, `ollama_model`, `ollama_num_gpu`, `mode`
-- `POST /api/settings` — validates, mutates the live `settings` singleton, and writes to `.env`
-- `POST /api/reinitialize` — calls `TranscriptionEngine.reset()` + `transcription.load()` in a thread executor; takes several seconds while Whisper reloads. Disconnect and reconnect after to get a new `AudioProcessor` on the new engine.
-- `GET /api/ollama/models` — proxies `GET /api/tags` from Ollama and returns locally pulled model names; returns `{"models": []}` if Ollama is unreachable
+- `POST /api/settings` — validates, mutates the live `settings` singleton, writes to `.env`
+- `POST /api/reinitialize` — calls `TranscriptionEngine.reset()` + `transcription.load()` in a thread executor. Disconnect and reconnect after to get a new `AudioProcessor`.
+- `GET /api/ollama/models` — proxies Ollama `/api/tags`; returns `{"models": []}` if unreachable
 
-The ⚙ button in the top bar opens `SettingsModal`, which exposes: Whisper model (tiny/base/small), Ollama model (dropdown from `/api/ollama/models`), Ollama device (GPU/CPU toggle). **Save** writes `.env` only. **Save & Reinitialize** writes `.env` and calls `/api/reinitialize`.
-
-Ollama GPU/CPU is controlled via `OLLAMA_NUM_GPU`: `-1` sends `{"num_gpu": 999}` (all layers to GPU), `0` sends `{"num_gpu": 0}` (CPU). Always sent explicitly so Ollama reloads the model on device change rather than reusing a cached session.
+Ollama GPU/CPU is controlled via `OLLAMA_NUM_GPU`: `-1` sends `{"num_gpu": 999}` (GPU), `0` sends `{"num_gpu": 0}` (CPU).
 
 ## Cross-platform audio
 
@@ -119,60 +224,62 @@ Ollama GPU/CPU is controlled via `OLLAMA_NUM_GPU`: `-1` sends `{"num_gpu": 999}`
 | macOS | `sounddevice` | Needs BlackHole virtual device installed |
 | Linux | `sounddevice` | Select `.monitor` device from PulseAudio/PipeWire |
 
-`GET /api/devices` calls `list_loopback_devices()` so the UI can show a device picker.
-
-**WASAPI auto-detect** uses a three-tier match against the default output device name: exact → substring → first available loopback. The `is_recommended` flag in the device list uses the same logic. This handles cases where the loopback device name doesn't exactly match the output device name.
+**WASAPI auto-detect:** three-tier match against default output device name: exact → substring → first available loopback. The `is_recommended` flag uses the same logic.
 
 ## RAG (full mode)
 
 ChromaDB collection: `"textbook"`, cosine similarity, 384-dim embeddings (`all-MiniLM-L6-v2`).
-Chunk IDs: `"{filename}::chunk::{index}"` — deterministic, so re-uploading the same PDF is a safe upsert.
-`chroma_path` defaults to `%LOCALAPPDATA%\lecture-assistant\chroma_db` on Windows to avoid OneDrive SQLite lock issues.
+Chunk IDs: `"{filename}::chunk::{index}"` — deterministic, re-uploading the same PDF is a safe upsert.
+`chroma_path` defaults to `%LOCALAPPDATA%\lecture-assistant\chroma_db` on Windows (avoids OneDrive SQLite lock issues).
 Chunk size: 1000 chars, overlap: 150 chars, top-k: 6.
 
-**Multiple PDFs are supported.** Each PDF is stored with `{"source": filename}` metadata. The UI shows a dropdown to select the active textbook; `source=null` disables RAG and uses general knowledge only. The `retrieve()` method accepts an optional `source` parameter and filters ChromaDB with a `where` clause.
+Multiple PDFs supported. `retrieve()` accepts optional `source` param and filters with a ChromaDB `where` clause. The LLM prompt uses "ONLY the textbook passages" wording to prevent small models from ignoring context.
 
-RAG endpoints:
-- `POST /api/ingest` — upload a PDF; returns `{chunks_stored, filename}`
-- `GET /api/rag/sources` — list all uploaded PDF filenames
-- `GET /api/rag/status` — `{chunks_stored, has_textbook}`
-- `DELETE /api/rag/sources` — delete all chunks from ChromaDB; returns `{deleted: N}`
-
-The LLM prompt uses "ONLY the textbook passages" wording (not "AND your own knowledge") to prevent small models from ignoring provided context.
+RAG endpoints: `POST /api/ingest`, `GET /api/rag/sources`, `GET /api/rag/status`, `DELETE /api/rag/sources`.
 
 ## Environment (.env)
 
 ```
-MODE=full                    # lite or full
+MODE=full
 WHISPER_MODEL=base           # tiny | base | small
-WHISPER_DEVICE=cuda          # cuda | cpu (informational; FasterWhisperASR uses device=auto internally)
-WHISPER_COMPUTE_TYPE=float16 # float16 (GPU) | int8 (CPU) (informational; FasterWhisperASR uses compute_type=auto internally)
-AUDIO_DEVICE_INDEX=-1        # -1 = auto-detect, or pick from /api/devices
+WHISPER_DEVICE=cuda          # informational; FasterWhisperASR uses device=auto internally
+WHISPER_COMPUTE_TYPE=float16 # informational; FasterWhisperASR uses compute_type=auto internally
+AUDIO_DEVICE_INDEX=-1        # -1 = auto-detect
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2:3b
-OLLAMA_NUM_GPU=-1            # -1 = GPU (sends num_gpu:999 to Ollama), 0 = CPU (sends num_gpu:0)
+OLLAMA_NUM_GPU=-1            # -1 = GPU, 0 = CPU
 CHROMA_PATH=C:/Users/aidan/AppData/Local/lecture-assistant/chroma_db
 ```
 
 ## Python environment
 
-- `.venv` uses **Python 3.12** (`py -3.12 -m venv .venv`). Python 3.14 is incompatible with PyTorch wheels.
+- `.venv` uses **Python 3.12** (`py -3.12 -m venv .venv`). Python 3.14 incompatible with PyTorch wheels.
 - PyTorch: `2.5.1+cu121` (CUDA 12.1, RTX 4060).
-- WhisperLiveKit requires `faster-whisper>=1.2.0`. Installing via `pip install -e WhisperLiveKit/` upgrades it automatically.
-- Two env vars are set in `main.py` before any imports: `HF_HUB_DISABLE_SYMLINKS_WARNING=1` (harmless on Windows without Developer Mode) and `ANONYMIZED_TELEMETRY=False` (ChromaDB posthog API mismatch in 0.5.x).
-- On Windows, use `npm.cmd` not `npm` in PowerShell (execution policy blocks `.ps1` wrappers).
-- **Do not install `datasets` or `pyarrow` on Windows.** `pyarrow 24.0.0` (pulled by `datasets`) causes an `arrow.dll` access violation (exit code -1073741819) that crashes the entire Python process on startup. Neither package is required by this app.
+- WhisperLiveKit requires `faster-whisper>=1.2.0`. Install via `pip install -e WhisperLiveKit/`.
+- Two env vars set in `main.py` before imports: `HF_HUB_DISABLE_SYMLINKS_WARNING=1`, `ANONYMIZED_TELEMETRY=False`.
+- Use `npm.cmd` not `npm` in PowerShell.
+- **Do not install `datasets` or `pyarrow` on Windows.** `pyarrow 24.0.0` causes an `arrow.dll` access violation (exit -1073741819) that crashes Python on startup.
 
 ## Dependencies
 
 - `requirements-lite.txt` — FastAPI, uvicorn, faster-whisper, sounddevice, pyaudiowpatch
 - `requirements-full.txt` — extends lite + httpx, chromadb, sentence-transformers, torch, PyMuPDF, whisperlivekit
 - `requirements-dev.txt` — extends full + pytest, ruff
-- CUDA PyTorch must be installed before `requirements-full.txt`: `pip install torch --index-url https://download.pytorch.org/whl/cu121`
+- CUDA PyTorch first: `pip install torch --index-url https://download.pytorch.org/whl/cu121`
 
 ## Install scripts
 
 - `install.ps1` — Windows (interactive, GPU-aware, installs Ollama, builds frontend)
 - `install.sh` — macOS/Linux (checks BlackHole on macOS, ROCm on Linux)
 
-Both scripts write `.env` and are idempotent (safe to re-run to change mode).
+Both scripts write `.env` and are idempotent.
+
+## Common pitfalls
+
+- **WhisperLiveKit pruning:** `validated_segments` older than 5 min are silently dropped by `_prune()`. Always use `all_frontend_lines` dict in `send_results()` as the send buffer — never `frontend_lines` rebuilt fresh from `d.get("lines", [])`.
+- **Sub_key stability:** The `start` field of each line object is the React key AND the clearedIds key. It must never change after first insertion. Use `start_key` (s_idx=0) or `f"{start_key}:{s_idx}"`. Never use an interpolated timestamp as the sub_key — interpolated timestamps shift as in-progress segments grow.
+- **`all_transcript_lines`:** Defined in the `transcribe_ws` outer scope. Do not redeclare inside any inner function (`send_results`, `summary_loop`, etc.) — it is shared by closure.
+- **Markdown in UI:** Use `<MarkdownText>` not `<p>` for any LLM-generated text. The LLM is prompted to use `**bold**` and `- bullets`; plain `<p>` renders those as literal characters.
+- **Session save shape:** `SessionData` (in `types.ts`) is the canonical format for both localStorage autosave and downloaded `.json` files. Both use `restoreSession(lines, summaries)` to restore.
+- **`npm.cmd`** not `npm` on Windows PowerShell. `npm` is a `.ps1` wrapper blocked by execution policy.
+- **`pyarrow` / `datasets`** — never install on Windows; causes fatal DLL crash on import.
