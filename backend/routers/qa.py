@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from backend.llm import ollama
 from backend.rag import get_rag
+from backend.routers.ws_transcribe import get_transcript_context
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -43,6 +44,8 @@ def build_prompt(
     transcript_context: Optional[str] = None,
 ) -> str:
     """Build an Ollama prompt. source=None means no textbook — general knowledge only."""
+    from backend.config import settings
+
     chunks: list[str] = []
     if source:
         try:
@@ -55,6 +58,25 @@ def build_prompt(
             logger.warning("RAG retrieval failed: %s", exc)
 
     rag_ctx = "\n\n---\n\n".join(chunks) if chunks else None
+
+    if settings.debug:
+        logger.debug(
+            "=== QA REQUEST ===\n"
+            "  question        : %s\n"
+            "  source          : %s\n"
+            "  rag_chunks      : %d\n"
+            "  transcript_ctx  : %s chars\n"
+            "  variant         : %s",
+            question, source, len(chunks),
+            len(transcript_context) if transcript_context else 0,
+            "rag+transcript" if rag_ctx and transcript_context
+            else "rag" if rag_ctx
+            else "transcript" if transcript_context
+            else "general",
+        )
+        if chunks:
+            for i, c in enumerate(chunks):
+                logger.debug("  chunk[%d]: %.200s", i, c.replace("\n", " "))
 
     if rag_ctx and transcript_context:
         return (
@@ -85,7 +107,8 @@ class QARequest(BaseModel):
 
 @router.post("/api/qa")
 async def ask_question(req: QARequest):
-    prompt = build_prompt(req.question, source=req.source)
+    transcript_ctx = get_transcript_context() or None
+    prompt = build_prompt(req.question, source=req.source, transcript_context=transcript_ctx)
 
     async def generate():
         async for token in ollama.chat_stream(prompt):

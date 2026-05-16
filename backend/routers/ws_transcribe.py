@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 
 SUMMARY_INTERVAL_SECONDS = 120
 
+# Most-recent session's transcript — updated by reference so QA can read live state.
+_session_transcript: list = []
+
+
+def get_transcript_context(max_chars: int = 4000) -> str:
+    """Return a plain-text excerpt of the current session transcript for QA context."""
+    if not _session_transcript:
+        return ""
+    text = " ".join(e.get("text", "") for e in _session_transcript)
+    return text[-max_chars:] if len(text) > max_chars else text
+
 _HALLUCINATION = re.compile(
     r"^[.…,!?\-\s]+$"
     r"|^(uh+|um+|hmm*|hm+)\.?$"
@@ -90,6 +101,17 @@ async def transcribe_ws(websocket: WebSocket):
     content_type: str = init.get("content_type") or "general"
     user_context: str = init.get("user_context") or ""
 
+    if settings.debug:
+        logger.debug(
+            "=== WS CONNECT ===\n"
+            "  student_name : %r\n"
+            "  device_index : %d\n"
+            "  source       : %r\n"
+            "  content_type : %s\n"
+            "  user_context : %r",
+            student_name, device_index, source, content_type, user_context,
+        )
+
     audio_processor = make_processor()
     results_gen = await audio_processor.create_tasks()
 
@@ -107,17 +129,25 @@ async def transcribe_ws(websocket: WebSocket):
 
     # Shared accumulator: all de-duplicated transcript lines for this session.
     # Both send_results (appender) and summary_loop (reader) reference this list.
+    # Also aliased to module-level _session_transcript so the QA endpoint can read it.
+    global _session_transcript
     all_transcript_lines: list = []
+    _session_transcript = all_transcript_lines
 
-    # Serialise all WebSocket sends so concurrent tasks don't interleave frames.
-    send_lock = asyncio.Lock()
+    # Outbox queue: all tasks enqueue messages here; ws_sender is the sole WebSocket writer.
+    # put_nowait never blocks, so send_results is never stalled by WebSocket send latency.
+    outbox: asyncio.Queue = asyncio.Queue()
 
-    async def safe_send(data: dict):
-        async with send_lock:
+    async def ws_sender():
+        """Drain outbox and write to WebSocket. Single writer — no lock needed."""
+        while True:
             try:
-                await websocket.send_json(data)
+                msg = await outbox.get()
+                await websocket.send_json(msg)
+            except asyncio.CancelledError:
+                break
             except Exception:
-                pass
+                break
 
     _CONTENT_FOCUS = {
         "lecture":  "key concepts, definitions, examples, and topics covered by the instructor",
@@ -175,9 +205,9 @@ async def transcribe_ws(websocket: WebSocket):
             collected: list[str] = []
             async for token in ollama.chat_stream(prompt):
                 collected.append(token)
-                await safe_send({"type": "summary", "id": summary_id, "token": token, "done": False})
+                outbox.put_nowait({"type": "summary", "id": summary_id, "token": token, "done": False})
 
-            await safe_send({"type": "summary", "id": summary_id, "token": "", "done": True})
+            outbox.put_nowait({"type": "summary", "id": summary_id, "token": "", "done": True})
             return "".join(collected)
         except Exception as e:
             logger.error("stream_summary error: %s", e)
@@ -212,8 +242,8 @@ async def transcribe_ws(websocket: WebSocket):
         update until the segment is committed, which is fine.
         """
         alerted_starts: set[str] = set()
-        seen_starts: set[str] = set()
         # Ordered dict sub_key → entry; never pruned, replaces WhisperLiveKit's pruned view.
+        # Entries are updated IN PLACE so all_transcript_lines references stay current.
         all_frontend_lines: dict[str, dict] = {}
 
         try:
@@ -262,8 +292,10 @@ async def transcribe_ws(websocket: WebSocket):
                         if sub_name_hit and sub_key not in alerted_starts:
                             alerted_starts.add(sub_key)
                             new_alerts.append(sentence)
+                            if settings.debug:
+                                logger.debug("NAME DETECTED in [%s]: %r", sub_key, sentence)
 
-                        entry = {
+                        new_fields = {
                             "start": sub_key,
                             "display_ts": display_ts,
                             "end": end_key,
@@ -271,16 +303,18 @@ async def transcribe_ws(websocket: WebSocket):
                             "name_detected": sub_name_hit,
                         }
 
-                        # Always write to update display_ts / text for in-progress segments.
-                        all_frontend_lines[sub_key] = entry
-
-                        if sub_key not in seen_starts:
-                            seen_starts.add(sub_key)
-                            all_transcript_lines.append(entry)
+                        if sub_key not in all_frontend_lines:
+                            # First time: insert and add the same dict object to the transcript
+                            # accumulator so future in-place updates are visible to summary_loop.
+                            all_frontend_lines[sub_key] = new_fields
+                            all_transcript_lines.append(all_frontend_lines[sub_key])
+                        else:
+                            # Update in place — preserves the reference held by all_transcript_lines.
+                            all_frontend_lines[sub_key].update(new_fields)
 
                 buffer = (d.get("buffer_transcription") or "").strip()
 
-                await safe_send({
+                outbox.put_nowait({
                     "type": "state",
                     "lines": list(all_frontend_lines.values()),
                     "buffer": buffer,
@@ -314,6 +348,12 @@ async def transcribe_ws(websocket: WebSocket):
             summary_id = f"summary-{summary_count}"
             last_summarized_idx = len(all_transcript_lines)
 
+            if settings.debug:
+                logger.debug(
+                    "=== SUMMARY TRIGGER id=%s  new_lines=%d  prior_summary=%d chars ===",
+                    summary_id, len(new_lines), len(prior_summary_text),
+                )
+
             # Await directly so we can capture completed text for the next round.
             completed = await stream_summary(summary_id, list(new_lines), prior_summary_text)
             if completed:
@@ -321,6 +361,7 @@ async def transcribe_ws(websocket: WebSocket):
 
     on_demand_count = 0
 
+    sender_task = asyncio.create_task(ws_sender())
     feed_task = asyncio.create_task(feed_audio())
     results_task = asyncio.create_task(send_results())
     summary_task = asyncio.create_task(summary_loop())
@@ -351,8 +392,9 @@ async def transcribe_ws(websocket: WebSocket):
         feed_task.cancel()
         results_task.cancel()
         summary_task.cancel()
+        sender_task.cancel()
         try:
-            await asyncio.gather(feed_task, results_task, summary_task, return_exceptions=True)
+            await asyncio.gather(feed_task, results_task, summary_task, sender_task, return_exceptions=True)
         except Exception:
             pass
         await audio_processor.process_audio(b"")

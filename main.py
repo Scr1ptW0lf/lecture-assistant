@@ -16,6 +16,8 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 # Disable ChromaDB telemetry (avoids posthog capture() API mismatch in 0.5.x)
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
+import logging
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,11 +26,48 @@ from fastapi.staticfiles import StaticFiles
 from backend.config import settings
 from backend.routers import devices, settings as settings_router, ws_transcribe
 
+_NOISY_LOGGERS = (
+    "whisperlivekit",
+    "faster_whisper",
+    "httpx",
+    "httpcore",
+    "chromadb",
+    "sentence_transformers",
+)
+
+
+def _configure_logging() -> None:
+    if not settings.debug:
+        return
+    # Lower root so backend DEBUG messages pass through uvicorn's handler.
+    logging.root.setLevel(logging.DEBUG)
+    # Silence third-party noise so our DEBUG lines stand out.
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    # Ensure our own loggers emit DEBUG.
+    logging.getLogger("backend").setLevel(logging.DEBUG)
+    logging.getLogger("__main__").setLevel(logging.DEBUG)
+
+
+_configure_logging()
+
 DIST = Path(__file__).parent / "frontend" / "dist"
+
+
+_logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Re-apply after uvicorn's dictConfig has run (uvicorn configures logging on startup).
+    _configure_logging()
+
+    if settings.debug:
+        _logger.debug("=== STARTUP PARAMETERS ===")
+        for k, v in settings.model_dump().items():
+            _logger.debug("  %-28s = %s", k, v)
+        _logger.debug("=== END STARTUP PARAMETERS ===")
+
     # Pre-load Whisper model so the first WS connection is fast
     from backend.transcription import load
     load()

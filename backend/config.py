@@ -13,6 +13,7 @@ def _default_chroma_path() -> str:
 
 class Settings(BaseSettings):
     mode: str = "full"  # "lite" or "full"
+    debug: bool = False  # enable verbose LLM/API/startup logging; silences WhisperLiveKit noise
 
     # Audio
     audio_device_index: int = -1  # -1 = auto-detect loopback

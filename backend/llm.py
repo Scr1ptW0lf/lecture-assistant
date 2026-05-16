@@ -1,10 +1,13 @@
 """Async Ollama HTTP client with streaming support."""
 import json
+import logging
 from typing import AsyncGenerator
 
 import httpx
 
 from backend.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaClient:
@@ -19,19 +22,35 @@ class OllamaClient:
 
     async def chat_stream(self, prompt: str) -> AsyncGenerator[str, None]:
         """Async generator yielding response tokens from Ollama."""
+        opts = self._ollama_options()
+        if settings.debug:
+            logger.debug(
+                "=== OLLAMA REQUEST  model=%s  options=%s ===\n%s\n=== END PROMPT ===",
+                settings.ollama_model, opts, prompt,
+            )
+
+        collected: list[str] = []
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream(
                 "POST",
                 f"{self.base_url}/api/generate",
-                json={"model": settings.ollama_model, "prompt": prompt, "stream": True, "options": self._ollama_options()},
+                json={"model": settings.ollama_model, "prompt": prompt, "stream": True, "options": opts},
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line:
                         continue
                     data = json.loads(line)
-                    yield data.get("response", "")
+                    token = data.get("response", "")
+                    if settings.debug:
+                        collected.append(token)
+                    yield token
                     if data.get("done"):
+                        if settings.debug:
+                            logger.debug(
+                                "=== OLLAMA RESPONSE (%d chars) ===\n%s\n=== END RESPONSE ===",
+                                sum(len(t) for t in collected), "".join(collected),
+                            )
                         break
 
     async def warmup(self):
