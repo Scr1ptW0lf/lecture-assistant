@@ -11,8 +11,6 @@ import type { AppMode, AudioDevice, SessionData } from "./types";
 const LS_NAME = "la_student_name";
 const LS_DEVICE = "la_device_index";
 const LS_TRANSCRIPT_WIDTH = "la_transcript_width";
-const LS_CONTENT_TYPE = "la_content_type";
-const LS_USER_CONTEXT = "la_user_context";
 const LS_AUTOSAVE = "la_autosave_session";
 const DEFAULT_TRANSCRIPT_WIDTH = 600;
 const MIN_TRANSCRIPT_WIDTH = 280;
@@ -36,8 +34,8 @@ export default function App() {
   const [transcriptWidth, setTranscriptWidth] = useState<number>(
     () => Number(localStorage.getItem(LS_TRANSCRIPT_WIDTH) ?? DEFAULT_TRANSCRIPT_WIDTH)
   );
-  const [contentType, setContentType] = useState(() => localStorage.getItem(LS_CONTENT_TYPE) ?? "general");
-  const [userContext, setUserContext] = useState(() => localStorage.getItem(LS_USER_CONTEXT) ?? "");
+  const [contentType, setContentType] = useState("general");
+  const [userContext, setUserContext] = useState("");
   const [ragSources, setRagSources] = useState<string[]>([]);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
   const [pendingRestore, setPendingRestore] = useState<SessionData | null>(null);
@@ -61,12 +59,12 @@ export default function App() {
 
   const handleContentTypeChange = (type: string) => {
     setContentType(type);
-    localStorage.setItem(LS_CONTENT_TYPE, type);
+    sendContextUpdate(type, userContext);
   };
 
   const handleUserContextChange = (ctx: string) => {
     setUserContext(ctx);
-    localStorage.setItem(LS_USER_CONTEXT, ctx);
+    sendContextUpdate(contentType, ctx);
   };
 
   const refreshSources = useCallback(() => {
@@ -78,7 +76,7 @@ export default function App() {
     [triggerNotification]
   );
 
-  const { lines, bufferText, isConnected, connect, disconnect, clearLines, restoreSession, summaries, requestSummary } = useTranscript({
+  const { lines, bufferText, isConnected, connect, disconnect, clearLines, restoreSession, summaries, requestSummary, sendContextUpdate } = useTranscript({
     studentName,
     deviceIndex: selectedDevice,
     source: selectedSource,

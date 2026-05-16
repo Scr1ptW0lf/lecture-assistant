@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fetchOllamaModels, fetchSettings, reinitializeEngine, saveSettings } from "../api";
+import { fetchOllamaModels, fetchSettings, openVolumeMixer, reinitializeEngine, saveSettings } from "../api";
 import type { EngineSettings } from "../types";
 
 interface Props {
@@ -20,6 +20,7 @@ export function SettingsModal({ onClose }: Props) {
   const [draft, setDraft] = useState<EngineSettings | null>(null);
   const [ollamaModels, setOllamaModels] = useState<string[]>([]);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
+  const [mixerStatus, setMixerStatus] = useState<"idle" | "opening" | "unsupported">("idle");
 
   useEffect(() => {
     fetchSettings().then((s) => {
@@ -76,6 +77,16 @@ export function SettingsModal({ onClose }: Props) {
   const setField = <K extends keyof EngineSettings>(field: K) =>
     (val: EngineSettings[K]) =>
       setDraft((d) => (d ? { ...d, [field]: val } : d));
+
+  const handleOpenVolumeMixer = async () => {
+    setMixerStatus("opening");
+    try {
+      const res = await openVolumeMixer();
+      setMixerStatus(res.ok ? "idle" : "unsupported");
+    } catch {
+      setMixerStatus("idle");
+    }
+  };
 
   return (
     <div style={styles.backdrop} onClick={onClose}>
@@ -140,6 +151,26 @@ export function SettingsModal({ onClose }: Props) {
               </Section>
             </>
           )}
+          {/* Audio routing */}
+          <Section label="Audio Routing">
+            <button
+              style={{ ...styles.saveBtn, width: "100%", textAlign: "center" as const }}
+              onClick={handleOpenVolumeMixer}
+              disabled={mixerStatus === "opening"}
+            >
+              {mixerStatus === "opening" ? "Opening…" : "Open Volume Mixer"}
+            </button>
+            {mixerStatus === "unsupported" && (
+              <p style={{ ...styles.hint, color: "#fc8181" }}>Only supported on Windows.</p>
+            )}
+            <p style={styles.hint}>
+              Route a specific app (e.g. Teams, Zoom) to a virtual cable without
+              capturing all system audio.{" "}
+              <strong style={{ color: "#a0aec0" }}>Do not</strong> change the speaker in
+              Teams settings — use Windows Volume Mixer instead to avoid the "not working"
+              error. Teams → CABLE Input | Scribe device → CABLE Output.
+            </p>
+          </Section>
         </div>
 
         {status.kind === "done" && (

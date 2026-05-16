@@ -25,6 +25,12 @@ export async function reinitializeEngine(): Promise<void> {
   if (!res.ok) throw new Error(await res.text());
 }
 
+export async function openVolumeMixer(): Promise<{ ok: boolean; reason?: string }> {
+  const res = await fetch("/api/system/open-volume-mixer", { method: "POST" });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
 export async function fetchOllamaModels(): Promise<string[]> {
   try {
     const res = await fetch("/api/ollama/models");

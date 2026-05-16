@@ -119,5 +119,11 @@ export function useTranscript({ studentName, deviceIndex, source, contentType, u
     wsRef.current?.send(JSON.stringify({ type: "request_summary" }));
   }, []);
 
-  return { lines, bufferText, isConnected, connect, disconnect, clearLines, restoreSession, summaries, requestSummary };
+  const sendContextUpdate = useCallback((contentType: string, userContext: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "update_context", content_type: contentType, user_context: userContext }));
+    }
+  }, []);
+
+  return { lines, bufferText, isConnected, connect, disconnect, clearLines, restoreSession, summaries, requestSummary, sendContextUpdate };
 }

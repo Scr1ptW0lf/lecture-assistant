@@ -1,5 +1,7 @@
 import re
+import sys
 import asyncio
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -74,6 +76,18 @@ async def list_ollama_models():
         return {"models": names}
     except Exception:
         return {"models": []}
+
+
+@router.post("/api/system/open-volume-mixer")
+def open_volume_mixer():
+    if sys.platform != "win32":
+        return {"ok": False, "reason": "Only supported on Windows"}
+    subprocess.Popen(
+        ["cmd", "/c", "start", "", "ms-settings:apps-volume"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return {"ok": True}
 
 
 @router.post("/api/reinitialize")

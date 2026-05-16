@@ -98,8 +98,11 @@ async def transcribe_ws(websocket: WebSocket):
     student_name: str = init.get("student_name", "")
     device_index: int = int(init.get("device_index", -1))
     source: str | None = init.get("source") or None
-    content_type: str = init.get("content_type") or "general"
-    user_context: str = init.get("user_context") or ""
+    # Mutable so the update_context message can mutate values seen by stream_summary's closure.
+    ctx = {
+        "content_type": init.get("content_type") or "general",
+        "user_context": init.get("user_context") or "",
+    }
 
     if settings.debug:
         logger.debug(
@@ -109,7 +112,7 @@ async def transcribe_ws(websocket: WebSocket):
             "  source       : %r\n"
             "  content_type : %s\n"
             "  user_context : %r",
-            student_name, device_index, source, content_type, user_context,
+            student_name, device_index, source, ctx["content_type"], ctx["user_context"],
         )
 
     audio_processor = make_processor()
@@ -173,10 +176,10 @@ async def transcribe_ws(websocket: WebSocket):
             if not new_text.strip():
                 return ""
 
-            focus = _CONTENT_FOCUS.get(content_type, _CONTENT_FOCUS["general"])
-            context_line = f"Context: {user_context}\n" if user_context else ""
+            focus = _CONTENT_FOCUS.get(ctx["content_type"], _CONTENT_FOCUS["general"])
+            context_line = f"Context: {ctx['user_context']}\n" if ctx["user_context"] else ""
             content_label = {"lecture": "lecture", "meeting": "meeting", "video": "video",
-                             "podcast": "podcast", "general": "audio recording"}.get(content_type, "audio recording")
+                             "podcast": "podcast", "general": "audio recording"}.get(ctx["content_type"], "audio recording")
 
             if prior_summary:
                 prompt = (
@@ -384,6 +387,16 @@ async def transcribe_ws(websocket: WebSocket):
                                 "",  # on-demand: full transcript summary from scratch
                             )
                         )
+                    elif data.get("type") == "update_context":
+                        new_ct = data.get("content_type")
+                        if new_ct:
+                            ctx["content_type"] = new_ct
+                        ctx["user_context"] = data.get("user_context") or ""
+                        if settings.debug:
+                            logger.debug(
+                                "=== CONTEXT UPDATE === content_type=%s user_context=%r",
+                                ctx["content_type"], ctx["user_context"],
+                            )
                 except Exception:
                     pass
     except (WebSocketDisconnect, Exception):

@@ -51,14 +51,26 @@ fi
 if [ "$OS" = "Darwin" ]; then
     if ! system_profiler SPAudioDataType 2>/dev/null | grep -qi "blackhole"; then
         echo ""
-        echo "⚠  BlackHole virtual audio device not found."
-        echo "   Lecture Assistant captures system audio via BlackHole on macOS."
+        echo "WARNING: BlackHole virtual audio device not found."
+        echo "   Scribe captures system audio via BlackHole on macOS."
         echo "   Install it from: https://existential.audio/blackhole/"
-        echo "   After installing, set BlackHole as your audio output, then re-run this script."
+        echo ""
+        echo "   For isolated meeting transcription (Teams/Zoom):"
+        echo "   1. Install BlackHole 2ch"
+        echo "   2. Open Audio MIDI Setup, create a Multi-Output Device with"
+        echo "      both BlackHole 2ch AND your real speakers/headphones"
+        echo "   3. In Teams: Settings > Audio > Speaker -> Multi-Output Device"
+        echo "   4. In Scribe: select 'BlackHole 2ch' as your capture device"
+        echo "   Result: you hear the meeting AND Scribe transcribes it;"
+        echo "           other apps still output to your real speakers normally."
         echo ""
         read -rp "Press Enter to continue anyway (you can install BlackHole later)..."
     else
-        echo "BlackHole detected ✓"
+        echo "BlackHole detected"
+        echo ""
+        echo "Tip — isolated meeting transcription:"
+        echo "  Create a Multi-Output Device (Audio MIDI Setup) with BlackHole + real speakers,"
+        echo "  set Teams speaker to that device, and select BlackHole in Scribe's device picker."
     fi
 fi
 
@@ -66,6 +78,10 @@ fi
 if [ "$OS" = "Linux" ]; then
     echo "Linux: System audio will be captured via PulseAudio/PipeWire monitor source."
     echo "       Select the correct .monitor device in the app's device picker."
+    echo ""
+    echo "Tip -- isolated meeting transcription (PipeWire):"
+    echo "  pactl load-module module-null-sink sink_name=scribe_sink sink_properties=device.description=ScribeSink"
+    echo "  Then set Teams speaker to 'ScribeSink' and select 'ScribeSink.monitor' in Scribe."
 fi
 
 # ── Mode selection ────────────────────────────────────────────────────────────
